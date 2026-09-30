@@ -1,24 +1,8 @@
-#!/usr/bin/env python3
-"""Reusable base class for computing derived variables from ICON ocean output.
+"""Reusable classes for calculation, time averaging, and Zarr storage.
 
-Subclasses only need to implement:
-  - preprocess(ds)    — input-specific unit checks / conversions
-  - compute(ds)       — the actual physics (returns xr.Dataset with attrs)
-
-Everything else (catalog I/O, Zarr lifecycle, year-by-year writing,
-weighted-mean finalization, dask cluster setup) is handled here.
-
-Example subclass (minimal):
-    class MyPipeline(ICONPipeline):
-        def __init__(self):
-            super().__init__(name="mld", input_variables=["to", "so"],
-                             output_names=("mld",), title="ICON mixed layer depth")
-
-        def compute(self, ds):
-            mld = ...  # your calculation
-            return xr.Dataset({"mld": mld}).transpose(*self.DIMS)
+No task configuration, physical formulas, CLI entry point, or task orchestration
+belongs here. Import the classes in a task script and compose them there.
 """
-import argparse
 import gc
 import inspect
 import json
@@ -27,28 +11,267 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import dask.array as da
-import intake
 import numpy as np
 import xarray as xr
-import zarr
-from distributed import Client, LocalCluster
+
+
+class TimeSelection:
+    """Shared time-coordinate validation and inclusive selection."""
+
+    @staticmethod
+    def select_period(ds, start=None, end=None):
+        """Select inclusive year/month/date bounds on sorted, unique input times.
+
+        Missing bounds use all available data. Selection uses available timestamps;
+        it does not infer missing samples or require full coverage of the bounds.
+        """
+        if "time" not in ds.indexes:
+            raise ValueError("Input must have an indexed time coordinate")
+        index = ds.indexes["time"]
+        if not index.is_monotonic_increasing or not index.is_unique:
+            raise ValueError("时间必须严格递增且无重复。")
+        selected = ds.sel(time=slice(None if start is None else str(start),
+                                    None if end is None else str(end)))
+        if selected.sizes["time"] == 0:
+            raise ValueError(f"{start} 至 {end}: 所选时间段没有数据。")
+        return selected
+
+
+class ZarrIO:
+    """Zarr v2 storage, encoding, and verified output lifecycle."""
+
+    @staticmethod
+    def format_options():
+        key = ("zarr_format" if "zarr_format" in inspect.signature(xr.Dataset.to_zarr).parameters
+               else "zarr_version")
+        return {key: 2}
+
+    @staticmethod
+    def clean_encoding(ds):
+        ds = ds.copy(deep=False)
+        for name in ds.variables:
+            chunks = ds[name].chunks
+            shape = tuple(c[0] for c in chunks) if chunks else ds[name].shape
+            # Integer 1 permits scalar results with older xarray / newer Zarr.
+            ds[name].encoding = {"chunks": shape if shape else 1}
+        return ds
+
+    @staticmethod
+    def pending_path(target):
+        target = Path(target)
+        return target.with_name(target.stem + ".inprogress" + target.suffix)
+
+    @staticmethod
+    def ensure_available(*paths):
+        for path in paths:
+            if Path(path).exists():
+                raise FileExistsError(f"Output already exists; refusing to overwrite: {path}")
+
+    @staticmethod
+    def open(path, consolidated=None):
+        return xr.open_zarr(path, consolidated=consolidated)
+
+    def write(self, ds, path, *, clean=True, **options):
+        data = self.clean_encoding(ds) if clean else ds
+        return data.to_zarr(path, **options, **self.format_options())
+
+    def commit(self, pending, target):
+        import zarr
+        self.ensure_available(target)
+        zarr.consolidate_metadata(str(pending))
+        Path(pending).rename(target)
+        return Path(target)
+
+    def write_verified(self, ds, target):
+        """Write a complete Dataset, validate a sample, then publish its path."""
+        target = Path(target)
+        pending = self.pending_path(target)
+        self.ensure_available(target, pending)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self.write(ds, pending, mode="w-", consolidated=True)
+        with self.open(pending, consolidated=True) as saved:
+            if dict(saved.sizes) != dict(ds.sizes):
+                raise ValueError("Saved dimensions differ from computed output")
+            sample = {dim: slice(0, min(size, 3)) for dim, size in ds.sizes.items()}
+            xr.testing.assert_allclose(saved.isel(**sample).compute(),
+                                       ds.isel(**sample).compute())
+        return self.commit(pending, target)
+
+
+class TimeSeriesAverager:
+    """Independent time averaging: validate inputs, select strategy, reduce.
+
+    Call equal_mean(), monthly_mean(), or weighted_mean() explicitly, or use
+    period_mean() to dispatch according to the configured weighting. Spatial
+    dimensions are unrestricted and input timestamps are never resampled.
+    """
+
+    def __init__(self, variables=None, weighting="equal", io=None):
+        self.variables = self._normalize_variables(variables)
+        self._get_method(weighting)  # reject invalid configuration immediately
+        self.weighting = weighting
+        self.io = io if io is not None else ZarrIO()
+
+    # -- Validation: all checks happen before the physical fields are reduced. --
+
+    @staticmethod
+    def _normalize_variables(variables):
+        if variables is None:
+            return None
+        if isinstance(variables, str):
+            return (variables,)
+        return tuple(variables)
+
+    def _validate_input(self, series):
+        """Return the validated Dataset and resolved scientific variables."""
+        if not isinstance(series, xr.Dataset):
+            raise TypeError("Input must be an xarray Dataset")
+        series = TimeSelection.select_period(series)
+        variables = self.variables
+        if variables is None:
+            variables = tuple(name for name, var in series.data_vars.items()
+                              if "time" in var.dims and np.issubdtype(var.dtype, np.number))
+        if not variables or len(set(variables)) != len(variables):
+            raise ValueError("Select at least one unique time-dependent variable")
+        if "valid_time_count" in variables:
+            raise ValueError("valid_time_count is reserved for output coverage")
+        for name in variables:
+            if name not in series.data_vars or "time" not in series[name].dims:
+                raise ValueError(f"Variable {name!r} must be a time-dependent data variable")
+            if not np.issubdtype(series[name].dtype, np.number):
+                raise ValueError(f"Variable {name!r} must be numeric")
+        return series, list(variables)
+
+    @staticmethod
+    def _validate_monthly_time(series):
+        """Require calendar dates and at most one sample per calendar month."""
+        try:
+            month_ids = series.time.dt.year.values * 12 + series.time.dt.month.values
+        except (AttributeError, TypeError) as exc:
+            raise ValueError("Monthly weighting requires a calendar time coordinate") from exc
+        if len(np.unique(month_ids)) != len(month_ids):
+            raise ValueError("days_in_month 权重只适用于每月最多一个样本的数据。")
+
+    @staticmethod
+    def _validate_weights(series, weights):
+        """Validate only the small weight array, keeping scientific data lazy."""
+        if not isinstance(weights, xr.DataArray):
+            raise TypeError("Weights must be an xarray DataArray")
+        if weights.dims != ("time",) or "time" not in weights.indexes:
+            raise ValueError("Weights must have exactly the indexed time dimension")
+        if (not np.issubdtype(weights.dtype, np.number)
+                or np.issubdtype(weights.dtype, np.complexfloating)):
+            raise ValueError("Weights must be real numeric values")
+        _, weights = xr.align(series, weights, join="exact")
+        values = weights.compute().values
+        if (not np.isfinite(values).all() or (values < 0).any()
+                or not (values > 0).any()):
+            raise ValueError("Weights must be finite, nonnegative, and have positive total")
+        return weights
+
+    def _validate_paths(self, input_path, output_path):
+        source = Path(input_path).resolve()
+        target = Path(output_path).resolve()
+        pending = self.io.pending_path(target)
+        if source == target or source in target.parents or source in pending.parents:
+            raise ValueError("Output must be separate from the input Zarr store")
+        self.io.ensure_available(target, pending)
+        return source, target
+
+    # -- Strategies: each public method validates before invoking the reducer. --
+
+    def _get_method(self, weighting):
+        methods = {"equal": self.equal_mean, "days_in_month": self.monthly_mean}
+        if weighting not in methods:
+            raise ValueError(f"Unsupported mean weighting: {weighting}")
+        return methods[weighting]
+
+    def equal_mean(self, series):
+        """Give each input time equal weight; skip NaNs per variable/grid cell."""
+        series, variables = self._validate_input(series)
+        weights = xr.ones_like(series.time, dtype="float64")
+        return self._calculate_mean(series, variables, weights, "equal weights")
+
+    def monthly_mean(self, series):
+        """Average existing monthly values using days in month; no resampling."""
+        series, variables = self._validate_input(series)
+        self._validate_monthly_time(series)
+        weights = series.time.dt.days_in_month.astype("float64")
+        return self._calculate_mean(series, variables, weights, "days_in_month weights")
+
+    def weighted_mean(self, series, weights):
+        """Use caller-supplied weights matching the selected time coordinate.
+
+        Supply duration weights for irregular samples. Finite nonnegative
+        weights are required, with at least one positive value.
+        """
+        series, variables = self._validate_input(series)
+        weights = self._validate_weights(series, weights)
+        return self._calculate_mean(series, variables, weights, "explicit weights")
+
+    def period_mean(self, series, weights=None):
+        """Dispatch to the configured strategy; explicit weights override it."""
+        if weights is not None:
+            return self.weighted_mean(series, weights)
+        return self._get_method(self.weighting)(series)
+
+    # -- Shared reduction/output metadata: no strategy-specific branches. --
+
+    def _calculate_mean(self, series, variables, weights, method):
+        mean = (series[variables].weighted(weights)
+                .mean("time", skipna=True, keep_attrs=True))
+        return self._annotate_result(mean, series, variables, method)
+
+    @staticmethod
+    def _annotate_result(mean, series, variables, method):
+        method = f"{method}, renormalized over valid samples"
+        mean.attrs = {
+            **series.attrs,
+            "temporal_product": "mean over selected input times",
+            "averaging_method": method,
+            "time_count": series.sizes["time"],
+            "actual_time_start": str(series.time.values[0]),
+            "actual_time_end": str(series.time.values[-1]),
+            "period": f"{series.time.values[0]} to {series.time.values[-1]}",
+        }
+        for name in variables:
+            mean[name].attrs = {**mean[name].attrs,
+                                "cell_methods": f"time: mean ({method})"}
+        # Coverage refers to the first selected variable, including zero-weight
+        # times; it is not the denominator used by the weighted mean.
+        ref_var = variables[0]
+        mean["valid_time_count"] = series[ref_var].count("time").astype("int32")
+        mean.valid_time_count.attrs = {
+            "units": "1", "expected_time_count": series.sizes["time"],
+            "reference_variable": ref_var,
+            "long_name": "Number of non-missing input times for the reference variable",
+        }
+        return mean
+
+    def average_zarr(self, input_path, output_path, *, start=None, end=None, weights=None):
+        """Validate paths, select saved values, dispatch averaging, then save."""
+        source, target = self._validate_paths(input_path, output_path)
+        with self.io.open(source) as raw:
+            selected = TimeSelection.select_period(raw, start, end)
+            mean = self.period_mean(selected, weights=weights)
+            mean.attrs["source_timeseries"] = str(source)
+            mean.attrs["requested_start"] = "all available" if start is None else str(start)
+            mean.attrs["requested_end"] = "all available" if end is None else str(end)
+            return self.io.write_verified(mean, target)
 
 
 class ICONPipeline:
-    """Base pipeline: open ICON data → compute → write monthly Zarr → weighted mean."""
+    """Calculation template: read → preprocess → compute each time → save.
+
+    Subclasses implement physical formulas. This class never calls an averager.
+    """
 
     CATALOG = "https://raw.githubusercontent.com/eerie-project/intake_catalogues/main/eerie.yaml"
-    PERIODS = (
-        (1950, 1969,
-         "dkrz.disk.model-output.icon-esm-er.hist-1950.v20240618.ocean.gr025.ml_monthly_mean"),
-        (2031, 2050,
-         "dkrz.disk.model-output.icon-esm-er.highres-future-ssp245.v20240618.ocean.gr025.model-level_monthly_mean"),
-    )
     DIMS = ("time", "lev", "lat", "lon")
     CHUNKS = {"time": 12, "lev": 6, "lat": 90, "lon": 180}
 
-    def __init__(self, name, input_variables, output_names, title=None, base_dir=None):
+    def __init__(self, name, input_variables, output_names, periods,
+                 title=None, base_dir=None, time_product="timeseries", io=None):
         """
         Parameters
         ----------
@@ -58,6 +281,11 @@ class ICONPipeline:
             Variables to select from the catalog (e.g. ["so", "to"]).
         output_names : tuple[str, ...]
             Names of the computed output variables (e.g. ("sigma0_eos80", "sigma2_eos80")).
+        periods : sequence of (start, end, catalog_entry)
+            Inclusive bounds: integer years or strings such as "1950-03" or
+            "1950-03-15". Source time coordinates are preserved exactly.
+        time_product : str
+            Filename suffix, e.g. "monthly" or "daily"; does not resample data.
         title : str, optional
             Human-readable title stored in Zarr global attrs.
         base_dir : str or Path, optional
@@ -66,7 +294,14 @@ class ICONPipeline:
         self.name = name
         self.input_variables = list(input_variables)
         self.output_names = tuple(output_names)
-        self.title = title or f"ICON-ESM-ER monthly {', '.join(output_names)}"
+        self.title = title or f"ICON-ESM-ER {', '.join(output_names)}"
+        self.periods = tuple(periods)
+        if not self.periods:
+            raise ValueError("At least one period must be configured by the task")
+        if not time_product or not all(c.isalnum() or c in "_-" for c in time_product):
+            raise ValueError("time_product must be a filename-safe label")
+        self.io = io if io is not None else ZarrIO()
+        self.time_product = time_product
         self.base = Path(base_dir) if base_dir else Path(__file__).resolve().parent
 
     # ------------------------------------------------------------------ #
@@ -79,7 +314,7 @@ class ICONPipeline:
         print(json.dumps(entry), flush=True)
         if msg:
             directory = self.base / "state"
-            directory.mkdir(exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
             target = directory / (msg + ".json")
             temporary = target.with_suffix(f".{os.getpid()}.tmp")
             temporary.write_text(json.dumps(entry, indent=2))
@@ -90,39 +325,11 @@ class ICONPipeline:
     # ------------------------------------------------------------------ #
 
     def paths(self, index):
-        """Return (pending, final, mean) Zarr paths for the given period index."""
-        start, end, _ = self.PERIODS[index]
+        """Return (pending, final) time-series paths for a configured period."""
+        start, end, _ = self.periods[index]
         prefix = self.base / "data" / f"{self.name}_icon_{start}-{end}"
-        return (Path(str(prefix) + "_monthly.inprogress.zarr"),
-                Path(str(prefix) + "_monthly.zarr"),
-                Path(str(prefix) + "_mean3d.zarr"))
-
-    @staticmethod
-    def zarr_format():
-        key = ("zarr_format" if "zarr_format" in inspect.signature(xr.Dataset.to_zarr).parameters
-               else "zarr_version")
-        return {key: 2}
-
-    # ------------------------------------------------------------------ #
-    #  Input I/O                                                          #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def select_period(ds, start_year, end_year):
-        """只操作时间坐标；不加载温盐全场。"""
-        years = ds.time.dt.year
-        selected = ds.sel(time=(years >= start_year) & (years <= end_year))
-        index = selected.indexes["time"]
-        if not index.is_monotonic_increasing or not index.is_unique:
-            raise ValueError("时间必须严格递增且无重复。")
-        actual = selected.time.dt.year.values * 12 + selected.time.dt.month.values - 1
-        expected = np.arange(start_year * 12, (end_year + 1) * 12)
-        if not np.array_equal(actual, expected):
-            raise ValueError(
-                f"{start_year}-{end_year}: 应有 {len(expected)} 个连续月份，"
-                f"实际 {len(actual)} 个；存在缺月、重复月份或边界不完整。"
-            )
-        return selected
+        return (Path(str(prefix) + f"_{self.time_product}.inprogress.zarr"),
+                Path(str(prefix) + f"_{self.time_product}.zarr"))
 
     @staticmethod
     def temperature_in_celsius(theta0, units_if_missing=None):
@@ -146,7 +353,8 @@ class ICONPipeline:
 
     def open_inputs(self, index):
         """Open the catalog entry, select variables, validate, and preprocess."""
-        start, end, key = self.PERIODS[index]
+        import intake
+        start, end, key = self.periods[index]
         raw = intake.open_catalog(self.CATALOG)[key].to_dask()
         try:
             ds = raw[self.input_variables]
@@ -158,7 +366,7 @@ class ICONPipeline:
             for coord in self.DIMS[1:]:
                 if ds[coord].dims != (coord,):
                     raise ValueError(f"Expected a 1D coordinate: {coord}")
-            ds = self.select_period(ds, start, end)
+            ds = TimeSelection.select_period(ds, start, end)
             ds = self.preprocess(ds)
             return raw, ds
         except BaseException:
@@ -191,21 +399,19 @@ class ICONPipeline:
     #  Validation                                                         #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _clean_encoding(ds):
-        ds = ds.copy(deep=False)
-        for name in ds.variables:
-            chunks = ds[name].chunks
-            ds[name].encoding = {"chunks": tuple(c[0] for c in chunks) if chunks else ds[name].shape}
-        return ds
+    def spatial_sample(self, ds):
+        """Use bounded spatial samples for any number of model levels."""
+        return ds.isel(
+            lev=np.unique(np.linspace(0, ds.sizes["lev"] - 1,
+                                      min(5, ds.sizes["lev"]), dtype=int)),
+            lat=slice(350, 356) if ds.sizes["lat"] >= 356 else slice(0, 6),
+            lon=slice(700, 706) if ds.sizes["lon"] >= 706 else slice(0, 6),
+        )
 
     def ocean_sample(self, ds):
         """Extract a tiny spatial/temporal subset for fast validation."""
-        return ds.isel(
-            time=[0, ds.sizes["time"] - 1],
-            lev=[0, 10, 35, 60, 71] if ds.sizes["lev"] >= 72 else slice(None),
-            lat=slice(350, 356) if ds.sizes["lat"] >= 356 else slice(None),
-            lon=slice(700, 706) if ds.sizes["lon"] >= 706 else slice(None),
+        return self.spatial_sample(ds).isel(
+            time=np.unique([0, ds.sizes["time"] - 1]),
         ).compute()
 
     def validate_sample(self, saved, inputs):
@@ -223,20 +429,20 @@ class ICONPipeline:
     # ------------------------------------------------------------------ #
 
     def run(self):
-        """Single-pass pipeline: for each period, prepare → calculate → finalize."""
-        (self.base / "data").mkdir(exist_ok=True)
+        """Compute/save native-time fields only; never call an averaging method."""
+        import dask.array as da
+        outputs = []
+        (self.base / "data").mkdir(parents=True, exist_ok=True)
 
-        for index, (start, end, key) in enumerate(self.PERIODS):
-            pending, final, meanpath = self.paths(index)
-            if any(p.exists() for p in (pending, final, meanpath)):
-                raise FileExistsError(
-                    f"Output already exists for {start}-{end}; refusing to overwrite")
+        for index, (start, end, key) in enumerate(self.periods):
+            pending, final = self.paths(index)
+            self.io.ensure_available(pending, final)
 
             self.log(f"period_{index}_open", state="opening", period=f"{start}-{end}")
             raw, ds = self.open_inputs(index)
             began = time.monotonic()
             try:
-                assert ds.sizes["time"] == 240 and ds.sizes["lev"] == 72
+                time_count = ds.sizes["time"]
 
                 # --- Validate with a small sample ---
                 small = self.ocean_sample(ds)
@@ -258,131 +464,47 @@ class ICONPipeline:
                 template.attrs = {
                     "title": self.title,
                     "source_catalog": self.CATALOG, "source_catalog_entry": key,
-                    "period": f"{start}-{end}", "month_count": 240,
+                    "period": f"{start}-{end}", "time_count": time_count,
+                    "actual_time_start": str(ds.time.values[0]),
+                    "actual_time_end": str(ds.time.values[-1]),
+                    "temporal_product": self.time_product,
+                    "time_processing": "native input timestamps; no resampling",
                     "created_utc": datetime.now(timezone.utc).isoformat(),
                 }
-                self._clean_encoding(template).to_zarr(
-                    pending, mode="w-", compute=False,
-                    consolidated=False, **self.zarr_format())
+                self.io.write(template, pending, mode="w-", compute=False,
+                              consolidated=False)
 
-                # --- Compute year by year ---
-                for year in range(start, end + 1):
-                    self.log(f"year_{year}", state="running", period=f"{start}-{end}",
+                # Write time-chunk-aligned batches; partial years and final
+                # short batches need no special offsets or calendar assumptions.
+                batch_size = self.CHUNKS["time"]
+                for offset in range(0, time_count, batch_size):
+                    stop = min(offset + batch_size, time_count)
+                    event = f"period_{index}_batch_{offset}"
+                    self.log(event, state="running", period=f"{start}-{end}",
+                             time_start=offset, time_stop=stop,
                              slurm_job=os.environ.get("SLURM_JOB_ID"))
-                    annual = ds.sel(time=ds.time.dt.year == year).chunk(self.CHUNKS)
-                    computed = self.compute(annual)
+                    batch = ds.isel(time=slice(offset, stop)).chunk(self.CHUNKS)
+                    computed = self.compute(batch)
                     payload = computed.drop_vars(list(computed.coords))
                     for name in payload:
                         payload[name].encoding = {}
-                    offset = 12 * (year - start)
-                    payload.to_zarr(
-                        pending, mode="r+",
-                        region={"time": slice(offset, offset + 12)},
-                        consolidated=False, **self.zarr_format())
-                    with xr.open_zarr(pending, consolidated=False) as saved:
-                        self.validate_sample(
-                            saved.isel(time=slice(offset, offset + 12)), annual)
-                    gc.collect()  # release file descriptors from zarr stores
-                    self.log(f"year_{year}", state="complete", year=year,
+                    self.io.write(payload, pending, clean=False, mode="r+",
+                                  region={"time": slice(offset, stop)}, consolidated=False)
+                    with self.io.open(pending, consolidated=False) as saved:
+                        self.validate_sample(saved.isel(time=slice(offset, stop)), batch)
+                    gc.collect()
+                    self.log(event, state="complete", time_start=offset, time_stop=stop,
                              elapsed_s=round(time.monotonic() - began, 1))
 
-                # --- Finalize: consolidate + weighted mean ---
-                self.log(f"period_{index}_finalize", state="running",
-                         phase="mean", period=f"{start}-{end}")
-                zarr.consolidate_metadata(str(pending))
-                with xr.open_zarr(pending, consolidated=True) as monthly:
-                    self.select_period(monthly, start, end)
-                    weights = monthly.time.dt.days_in_month.astype("float64")
-                    mean = (monthly[list(self.output_names)]
-                            .weighted(weights)
-                            .mean("time", skipna=True, keep_attrs=True))
-                    mean = mean.transpose(*self.DIMS[1:])
-                    mean.attrs = {
-                        **monthly.attrs,
-                        "temporal_product": "20-year mean of monthly values",
-                        "averaging_method":
-                            "days_in_month weights, renormalized over valid months",
-                    }
-                    for name in self.output_names:
-                        mean[name].attrs["cell_methods"] = \
-                            "time: mean (weighted by days in month)"
-                    # Count valid months using the first output variable.
-                    ref_var = self.output_names[0]
-                    mean["valid_month_count"] = \
-                        monthly[ref_var].count("time").astype("int16")
-                    mean.valid_month_count.attrs = {
-                        "units": "1", "expected_month_count": 240}
-                    meanpending = meanpath.with_name(
-                        meanpath.name.replace(".zarr", ".inprogress.zarr"))
-                    self._clean_encoding(mean).to_zarr(
-                        meanpending, mode="w-", consolidated=True,
-                        **self.zarr_format())
-                    with xr.open_zarr(meanpending, consolidated=True) as saved:
-                        assert dict(saved.sizes) == \
-                            {d: monthly.sizes[d] for d in self.DIMS[1:]}
-                        pick = dict(lev=[0, 10, 35, 60, 71],
-                                    lat=slice(350, 356), lon=slice(700, 706))
-                        xr.testing.assert_allclose(
-                            saved.isel(**pick).compute(),
-                            mean.isel(**pick).compute())
-                        stats = xr.Dataset({
-                            f"{name}_{method}": getattr(saved[name], method)()
-                            for name in self.output_names
-                            for method in ("min", "max")
-                        })
-                        stats["min_valid_months"] = saved.valid_month_count.min()
-                        stats["max_valid_months"] = saved.valid_month_count.max()
-                        summary = {k: float(v)
-                                   for k, v in stats.compute().data_vars.items()}
-                        if any(not np.isfinite(v) for v in summary.values()):
-                            raise ValueError(
-                                f"Non-finite global mean statistics: {summary}")
-                        if not (0 <= summary["min_valid_months"]
-                                <= summary["max_valid_months"] <= 240):
-                            raise ValueError("Invalid monthly coverage count")
-
-                pending.rename(final)
-                meanpending.rename(meanpath)
-                self.log(f"period_{index}_done", state="complete",
-                         period=f"{start}-{end}", monthly=str(final),
-                         mean3d=str(meanpath), statistics=summary,
+                # Commit the time series independently of any mean product.
+                self.io.commit(pending, final)
+                outputs.append(final)
+                self.log(f"period_{index}_computed", state="complete",
+                         period=f"{start}-{end}", timeseries=str(final),
                          elapsed_s=round(time.monotonic() - began, 1))
             finally:
                 raw.close()
 
-        self.log("pipeline_done", state="complete",
-                 periods=[f"{s}-{e}" for s, e, _ in self.PERIODS])
-
-    # ------------------------------------------------------------------ #
-    #  CLI entry point                                                    #
-    # ------------------------------------------------------------------ #
-
-    def main(self):
-        """Parse CLI args, create a dask LocalCluster, and run the pipeline."""
-        parser = argparse.ArgumentParser(
-            description=f"ICON pipeline: {self.name}")
-        parser.add_argument("--workers", type=int, default=32,
-                            help="Number of dask workers (default: 32)")
-        parser.add_argument("--threads", type=int, default=4,
-                            help="Threads per dask worker (default: 4)")
-        parser.add_argument("--memory", default="6GiB",
-                            help="Memory limit per dask worker (default: 6GiB)")
-        args = parser.parse_args()
-        try:
-            scratch = (
-                Path(os.environ.get("TMPDIR", "/tmp"))
-                / f"icon_{self.name}_{os.getuid()}"
-                  f"_{os.environ.get('SLURM_JOB_ID', os.getpid())}"
-            )
-            with LocalCluster(
-                n_workers=args.workers, threads_per_worker=args.threads,
-                memory_limit=args.memory, local_directory=str(scratch),
-                dashboard_address=None,
-            ) as cluster, Client(cluster):
-                self.log("cluster_ready", workers=args.workers,
-                         threads=args.threads, memory=args.memory,
-                         scratch=str(scratch))
-                self.run()
-        except BaseException as exc:
-            self.log("pipeline_failed", state="failed", error=repr(exc))
-            raise
+        self.log("compute_done", state="complete",
+                 periods=[f"{s}-{e}" for s, e, _ in self.periods])
+        return outputs

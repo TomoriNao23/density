@@ -2,10 +2,10 @@
 # ============================================================================
 # run_density.sbatch — Single-job ICON EOS-80 density pipeline on DKRZ Levante
 #
-# Processes both periods (1950-1969, 2031-2050) sequentially on one full node.
+# Processes periods configured in calculate_density.py sequentially.
 # 32 dask workers × 4 threads = 128 cores; ~6 GiB per worker.
 #
-# Usage:  sbatch run_density.sbatch
+# Usage:  mkdir -p logs && sbatch run_density.sbatch
 # ============================================================================
 #SBATCH --job-name=dens_icon
 #SBATCH --partition=shared
